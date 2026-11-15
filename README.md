@@ -58,4 +58,5 @@ When the sidebar is focused (`Ctrl+B`):
 
 ## License
 
-MIT — see [LICENSE](https://github.com/Sizasutfu/s-py-editor/blob/main/LICENSE) for details.
+MIT — see [LICENSE](https://github.com/Sizasutfu/s_py_editor/blob/main/LICENSE) for details.
+
