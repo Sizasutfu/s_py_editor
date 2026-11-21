@@ -17,6 +17,7 @@ except ImportError:
     jedi = None
 
 from prompt_toolkit import Application
+from prompt_toolkit.application import get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import (
     WordCompleter, Completer, Completion,
@@ -29,14 +30,16 @@ from prompt_toolkit.layout.containers import (
     HSplit, VSplit, Window, FloatContainer, Float, ConditionalContainer
 )
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.layout import Layout
 from prompt_toolkit.layout.margins import NumberedMargin
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.lexers import PygmentsLexer
 from prompt_toolkit.filters import Condition, has_focus, has_selection
+from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.selection import SelectionState
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import TextArea, Frame
+from prompt_toolkit.widgets import TextArea
 from pygments.lexers.python import PythonLexer
 
 
@@ -45,9 +48,16 @@ from pygments.lexers.python import PythonLexer
 FILE_PATH = sys.argv[1] if len(sys.argv) > 1 else None
 ROOT_DIR = os.getcwd()
 SIDEBAR_WIDTH = 32
-OUTPUT_WIDTH = 60
-OUTPUT_HEIGHT = 15
+OUTPUT_MIN_HEIGHT = 3    # rows, including the header line
+OUTPUT_MAX_HEIGHT = 12
 INDENT = '    '
+
+# On Termux, mouse reporting steals taps that would otherwise reopen the
+# soft keyboard, so it starts OFF there (Ctrl+T toggles it).
+IS_TERMUX = (
+    'TERMUX_VERSION' in os.environ
+    or 'com.termux' in os.environ.get('PREFIX', '')
+)
 
 # Auto-generate all keywords and built-in functions
 PYTHON_WORDS = set(keyword.kwlist + dir(builtins))
@@ -119,6 +129,10 @@ status = {'message': 'Ready'}
 dirty = {'v': False}
 pending = {'target': None, 'overwrite': None}
 dialog_state = {'active': False}
+mouse_state = {'on': not IS_TERMUX}
+
+dialog_active = Condition(lambda: dialog_state['active'])
+dialog_inactive = ~dialog_active
 
 
 def invalidate():
@@ -138,11 +152,13 @@ class OutputBuffer:
         self._lock = threading.Lock()
         self._last_redraw = 0.0
         self._timer_pending = False
+        self.version = 0  # bumped on every change; lets the view cache wrapped rows
 
     def clear(self):
         with self._lock:
             self._chunks.clear()
             self._size = 0
+            self.version += 1
 
     def write(self, s):
         if not s:
@@ -152,6 +168,7 @@ class OutputBuffer:
             self._size += len(s)
             while self._size > self.MAX_CHARS and len(self._chunks) > 1:
                 self._size -= len(self._chunks.popleft())
+            self.version += 1
         self._request_redraw()
         return len(s)
 
@@ -187,6 +204,18 @@ class OutputBuffer:
         with self._lock:
             return ''.join(self._chunks)
 
+    def gettail(self, max_chars):
+        """Return roughly the last max_chars characters (cheap for huge outputs)."""
+        with self._lock:
+            parts = []
+            total = 0
+            for chunk in reversed(self._chunks):
+                parts.append(chunk)
+                total += len(chunk)
+                if total >= max_chars:
+                    break
+        return ''.join(reversed(parts))[-max_chars:]
+
 
 exec_state = {
     'sink': OutputBuffer(),
@@ -195,6 +224,14 @@ exec_state = {
     'proc': None,
     'stopped': False,
     'show_output': False,
+}
+
+# scroll = rows above the newest output (0 = follow the tail)
+output_view = {
+    'scroll': 0,
+    'last_total': None,
+    'cache_key': None,
+    'cache_rows': [],
 }
 
 sidebar_state = {'visible': False}
@@ -277,15 +314,32 @@ rebuild_tree()
 
 # ---------- Rendering ----------
 
+def terminal_size():
+    try:
+        size = get_app().output.get_size()
+        return size.columns, size.rows
+    except Exception:
+        return 80, 24
+
+
 def get_status():
     path = FILE_PATH or '<untitled>'
     mod = '*' if dirty['v'] else ''
     run = ' [RUNNING]' if exec_state['running'] else ''
-    return (
-        f' {path}{mod}   |   {status["message"]}{run}   |   '
-        f'Ctrl+B sidebar  Ctrl+A sel-all  Ctrl+Z undo  F5 run  Ctrl+S save  '
-        f'Ctrl+X stop  Ctrl+E output  Ctrl+Q quit '
-    )
+    head = f' {path}{mod} | {status["message"]}{run} '
+
+    cols, _ = terminal_size()
+
+    if cols < 100:
+        # Short hints for phones / narrow terminals
+        hints = '| F5 run  ^S save  ^X stop  ^T mouse  ^Q quit '
+    else:
+        hints = (
+            '|  Ctrl+B sidebar  Ctrl+A sel-all  Ctrl+Z undo  F5 run  '
+            'Ctrl+S save  Ctrl+X stop  Ctrl+E output  Alt+Up/Down scroll output  '
+            'Ctrl+T mouse  Ctrl+Q quit '
+        )
+    return head + hints
 
 
 def get_sidebar_text():
@@ -310,21 +364,121 @@ def get_sidebar_cursor():
     return Point(0, tree_state['selected'])
 
 
-def get_output_text():
-    if not exec_state['label']:
-        return '(no output yet — press F5 to run)'
-    state = 'running (Ctrl+X stops)' if exec_state['running'] else 'done'
-    header = f'-- {exec_state["label"]}: {state} --'
+# ---------- Output panel (docked, scrollable) ----------
 
-    text = exec_state['sink'].getvalue()
+def output_height():
+    """Docked output panel height: ~1/3 of the screen, clamped."""
+    _, rows = terminal_size()
+    return max(OUTPUT_MIN_HEIGHT, min(OUTPUT_MAX_HEIGHT, rows // 3))
+
+
+def wrap_rows(text, cols):
     rows = []
     for line in text.split('\n'):
         line = line.rstrip('\r').expandtabs(4)
-        rows.extend(line[i:i + OUTPUT_WIDTH] for i in range(0, max(len(line), 1), OUTPUT_WIDTH))
+        rows.extend(line[i:i + cols] for i in range(0, max(len(line), 1), cols))
     if rows and rows[-1] == '' and text.endswith('\n'):
         rows.pop()
-    tail = rows[-(OUTPUT_HEIGHT - 1):]
-    return header + '\n' + '\n'.join(tail)
+    return rows
+
+
+def all_output_rows(cols):
+    """Every wrapped row of output, cached until the output or width changes."""
+    sink = exec_state['sink']
+    key = (sink.version, cols)
+    if output_view['cache_key'] != key:
+        output_view['cache_rows'] = wrap_rows(sink.getvalue(), cols)
+        output_view['cache_key'] = key
+    return output_view['cache_rows']
+
+
+def get_output_text():
+    cols, _ = terminal_size()
+    cols = max(10, cols)
+    body_rows = output_height() - 1  # one row is the header
+
+    if not exec_state['label']:
+        header = ' output — press F5 to run '
+        return [
+            ('class:output.header', header[:cols].ljust(cols)),
+            ('class:output', '\n(no output yet)'),
+        ]
+
+    state = 'running (Ctrl+X stops)' if exec_state['running'] else 'done'
+    scroll = output_view['scroll']
+
+    if scroll > 0:
+        rows = all_output_rows(cols)
+        total = len(rows)
+
+        # Keep the view anchored on the same lines while new output arrives
+        last = output_view['last_total']
+        if last is not None and total > last:
+            scroll += total - last
+
+        scroll = min(scroll, max(0, total - body_rows))
+        output_view['scroll'] = scroll
+        output_view['last_total'] = total if scroll > 0 else None
+
+        end = total - scroll
+        start = max(0, end - body_rows)
+        view = rows[start:end]
+        if scroll > 0:
+            header = f' {exec_state["label"]}: {state} | {start + 1}-{end}/{total} | Alt+End: follow '
+        else:
+            header = f' {exec_state["label"]}: {state} '
+    else:
+        # Following the tail: only wrap the last chunk (fast for huge outputs)
+        output_view['last_total'] = None
+        text = exec_state['sink'].gettail(cols * body_rows * 4 + 2000)
+        view = wrap_rows(text, cols)[-body_rows:]
+        header = f' {exec_state["label"]}: {state} '
+
+    return [
+        ('class:output.header', header[:cols].ljust(cols)),
+        ('class:output', '\n' + '\n'.join(view)),
+    ]
+
+
+def scroll_output(delta=0, to=None):
+    """delta > 0 scrolls up (older output); to='top' or 'bottom' jumps."""
+    if not exec_state['label']:
+        return
+    cols, _ = terminal_size()
+    cols = max(10, cols)
+    body_rows = output_height() - 1
+
+    rows = all_output_rows(cols)
+    max_scroll = max(0, len(rows) - body_rows)
+
+    if to == 'top':
+        new = max_scroll
+    elif to == 'bottom':
+        new = 0
+    else:
+        new = output_view['scroll'] + delta
+
+    new = max(0, min(max_scroll, new))
+    output_view['scroll'] = new
+    output_view['last_total'] = len(rows) if new > 0 else None
+    invalidate()
+
+
+def output_page():
+    return max(1, output_height() - 2)
+
+
+class OutputControl(FormattedTextControl):
+    """Output panel text that also reacts to the mouse wheel / touch swipes."""
+
+    def mouse_handler(self, mouse_event):
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            scroll_output(3)
+            return None
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            scroll_output(-3)
+            return None
+        return NotImplemented
 
 
 # ---------- Loop detection ----------
@@ -387,6 +541,8 @@ def run_code(code, label, first_line=1):
 
     sink = exec_state['sink']
     sink.clear()
+    output_view['scroll'] = 0          # new run: follow the tail again
+    output_view['last_total'] = None
     exec_state['label'] = label
     exec_state['stopped'] = False
     exec_state['show_output'] = True
@@ -496,14 +652,18 @@ editor_window = Window(
     left_margins=[NumberedMargin()],
 )
 
+# Docked output panel: fixed rows (adapts to screen size), full width, no clipping.
 output_window = Window(
-    FormattedTextControl(get_output_text),
+    OutputControl(get_output_text),
     style='class:output',
     wrap_lines=False,
+    height=lambda: Dimension.exact(output_height()),
 )
 
+status_window = Window(FormattedTextControl(get_status), height=1, style='reverse')
 
-# ---------- Save Dialog ----------
+
+# ---------- Save prompt (bottom line, right above the keyboard) ----------
 
 def _actual_save():
     global FILE_PATH
@@ -539,9 +699,9 @@ def do_save_with_name(buf):
     # Don't silently overwrite an existing file
     if os.path.exists(name) and pending['overwrite'] != name:
         pending['overwrite'] = name
-        status['message'] = f'{name} exists — press Enter again to overwrite, Esc to cancel'
+        status['message'] = f'{name} exists — Enter again to overwrite, Esc to cancel'
         invalidate()
-        return True  # keep the dialog open and the text in place
+        return True  # keep the prompt open and the text in place
 
     pending['overwrite'] = None
     FILE_PATH = name
@@ -556,13 +716,9 @@ filename_input = TextArea(
     multiline=False,
     accept_handler=do_save_with_name,
     height=1,
-    width=40,
+    prompt=' Save as: ',
+    style='class:savebar',
     focusable=True,
-)
-
-save_dialog = Frame(
-    filename_input,
-    title="Save As",
 )
 
 
@@ -675,7 +831,14 @@ body = VSplit([
     ),
     HSplit([
         editor_window,
-        Window(FormattedTextControl(get_status), height=1, style='reverse'),
+        # Output is docked right above the status bar (never off-screen)
+        ConditionalContainer(
+            output_window,
+            filter=Condition(lambda: exec_state['show_output']),
+        ),
+        status_window,
+        # Save prompt sits on the last row, directly above the soft keyboard
+        ConditionalContainer(filename_input, filter=dialog_active),
     ]),
 ])
 
@@ -687,20 +850,6 @@ root_container = FloatContainer(
             ycursor=True,
             content=CompletionsMenu(max_height=15, scroll_offset=1),
         ),
-        Float(
-            content=ConditionalContainer(
-                output_window,
-                filter=Condition(lambda: exec_state['show_output']),
-            ),
-            top=2, right=2, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT,
-        ),
-        Float(
-            content=ConditionalContainer(
-                save_dialog,
-                filter=Condition(lambda: dialog_state['active']),
-            ),
-            top=5, left=5,
-        ),
     ],
 )
 
@@ -710,9 +859,8 @@ root_container = FloatContainer(
 kb = KeyBindings()
 not_sidebar = ~has_focus(sidebar_control)
 in_editor = has_focus(buffer_control)
-
-# Filter to prevent global shortcuts from firing while the dialog is open
-dialog_inactive = ~Condition(lambda: dialog_state['active'])
+output_visible = Condition(lambda: exec_state['show_output'])
+can_scroll_output = output_visible & dialog_inactive
 
 @kb.add('c-b', filter=dialog_inactive)
 def toggle_sidebar(event):
@@ -724,6 +872,15 @@ def toggle_sidebar(event):
         sidebar_state['visible'] = True
         event.app.layout.focus(sidebar_control)
         status['message'] = 'Sidebar — arrows/Enter, Tab to edit, Ctrl+B hide'
+    event.app.invalidate()
+
+@kb.add('c-t', filter=dialog_inactive)
+def toggle_mouse(event):
+    mouse_state['on'] = not mouse_state['on']
+    if mouse_state['on']:
+        status['message'] = 'Mouse ON (swipe the output to scroll; Ctrl+T to turn off)'
+    else:
+        status['message'] = 'Mouse OFF (taps can reopen the keyboard)'
     event.app.invalidate()
 
 @kb.add('c-a', filter=has_focus(buffer_control))
@@ -787,7 +944,36 @@ def redo(event):
     status['message'] = 'Redo'
 
 
-@kb.add('escape', filter=Condition(lambda: dialog_state['active']), eager=True)
+# ----- Output scrolling (Alt+key; on Termux tap ALT, then the key) -----
+
+@kb.add('escape', 'up', filter=can_scroll_output)
+@kb.add('c-up', filter=can_scroll_output)
+def output_line_up(event):
+    scroll_output(1)
+
+@kb.add('escape', 'down', filter=can_scroll_output)
+@kb.add('c-down', filter=can_scroll_output)
+def output_line_down(event):
+    scroll_output(-1)
+
+@kb.add('escape', 'pageup', filter=can_scroll_output)
+def output_page_up(event):
+    scroll_output(output_page())
+
+@kb.add('escape', 'pagedown', filter=can_scroll_output)
+def output_page_down(event):
+    scroll_output(-output_page())
+
+@kb.add('escape', 'home', filter=can_scroll_output)
+def output_top(event):
+    scroll_output(to='top')
+
+@kb.add('escape', 'end', filter=can_scroll_output)
+def output_bottom(event):
+    scroll_output(to='bottom')
+
+
+@kb.add('escape', filter=dialog_active, eager=True)
 def cancel_save_dialog(event):
     dialog_state['active'] = False
     pending['overwrite'] = None
@@ -798,15 +984,14 @@ def cancel_save_dialog(event):
 
 @kb.add('c-s', filter=dialog_inactive)
 def save(event):
-    global FILE_PATH
     if FILE_PATH is None:
-        # Show the dialog and focus the input immediately (no deferred focus).
+        # Show the prompt and focus it immediately (no deferred focus).
         dialog_state['active'] = True
         pending['overwrite'] = None
         default_name = 'untitled.py'
         filename_input.buffer.reset(Document(default_name, len(default_name)))
         event.app.layout.focus(filename_input.window)
-        status['message'] = 'Enter filename (Enter to save, Esc to cancel)'
+        status['message'] = 'Type a filename (Enter to save, Esc to cancel)'
     else:
         _actual_save()
     event.app.invalidate()
@@ -868,6 +1053,8 @@ style = Style.from_dict({
     'sidebar': 'bg:#1e1e2e #c0c0d0',
     'sidebar.selected': 'bg:#4444aa #ffffff bold',
     'output': 'bg:#1a1a2a #dddddd',
+    'output.header': 'bg:#2e2e5e #ffffff bold',
+    'savebar': 'bg:#1f3a8a #ffffff bold',
 })
 
 
@@ -879,7 +1066,7 @@ app = Application(
     key_bindings=kb,
     full_screen=True,
     style=style,
-    mouse_support=True,
+    mouse_support=Condition(lambda: mouse_state['on']),
 )
 
 
